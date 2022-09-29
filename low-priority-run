@@ -6,6 +6,8 @@ import nvsmi
 import subprocess
 import os
 import time
+import sys
+import signal
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify, request
@@ -21,13 +23,14 @@ available_gpus: List[nvsmi.GPU] = nvsmi.get_available_gpus()
 command_occupied_gpu_ids: Set[int] = set()
 process: subprocess.Popen = None
 
+
 def start_process_on_gpus(command: str, gpu_ids: List[int]):
     """Start a process on the GPUs with the given IDs.
     """
     global process, command_occupied_gpu_ids
     # calculate the available gpus to be used
     command_occupied_gpu_ids = set(gpu_ids)
-    print("Start command: [ {} ] on gpus: {}".format(command, sorted(gpu_ids)))
+    print("* Start command: [ {} ] on gpus: {}".format(command, sorted(gpu_ids)))
 
     # set the environment variable CUDA_VISIBLE_DEVICES
     copied_env = os.environ.copy()
@@ -38,15 +41,36 @@ def start_process_on_gpus(command: str, gpu_ids: List[int]):
     process = subprocess.Popen(
         command,
         shell=True,
-        env=copied_env
+        env=copied_env,
+        preexec_fn=os.setsid
+        # https://stackoverflow.com/questions/4789837/how-to-terminate-a-python-subprocess-launched-with-shell-true
     )
 
-# update gpu info every 60 minutes
 def update_gpu_info():
+    """Update the available GPUs."""
     global available_gpus
     available_gpus = list(nvsmi.get_available_gpus())
-    print(f"* GPU info updated. Available GPUs: {[gpu.id for gpu in available_gpus]}")
+    print(
+        f"* GPU info updated. Available GPUs: {[gpu.id for gpu in available_gpus]}"
+    )
 
+def kill_process():
+    """Kill the process."""
+    global process
+    if process is not None:
+        print(f"* Sending SIGTERM to process: {process.pid}")
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        process = None
+
+def _sig_handler(_signo, _stack_frame):
+    """Handle the SIGTERM & SIGINT signal."""
+    kill_process()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _sig_handler)
+signal.signal(signal.SIGINT, _sig_handler)
+
+# Scheduler for periodically updating the GPU info
 sched = BackgroundScheduler(daemon=True)
 sched.add_job(update_gpu_info, 'interval', minutes=60)
 sched.start()
@@ -56,7 +80,7 @@ app = Flask(__name__)
 @app.route("/gpu", methods=["POST"])
 def set_occupied():
     """Set the GPU to occupied.
-    
+
     Request body:
     {
         "command": "set_occupied",
@@ -67,12 +91,14 @@ def set_occupied():
     if request.method == 'POST':
         posted_data = request.get_json()
         if posted_data['command'] == 'set_occupied':
-            gpu_ids_occupied_by_others: List[str] = posted_data['gpu_ids']
-            
+            gpu_ids_occupied_by_others: List[str] = list(map(str, posted_data['gpu_ids']))
+
             # kill the process if it is using the gpus to be occupied
             if process is not None:
-                print(f"- Request Set Occupied GPUs: {gpu_ids_occupied_by_others}")
-                print(f"- Current Command Occupied GPUs: {command_occupied_gpu_ids}")
+                print(
+                    f"- Request Set Occupied GPUs: {gpu_ids_occupied_by_others}; "
+                    f"Current Command Occupied GPUs: {sorted(command_occupied_gpu_ids)}"
+                )
                 if any([
                     gpu_id in command_occupied_gpu_ids
                     for gpu_id in gpu_ids_occupied_by_others
@@ -81,21 +107,23 @@ def set_occupied():
                         f"Process is using some of the GPUs "
                         f"to be occupied {gpu_ids_occupied_by_others}, kill the process."
                     )
-                    process.kill()
+                    kill_process()
                     # wait for the process to free the gpus
                     time.sleep(10)
 
             # update gpu info and get the available gpus
             update_gpu_info()
             available_gpus = [
-                gpu 
-                for gpu in available_gpus 
+                gpu for gpu in available_gpus
                 if gpu.id not in gpu_ids_occupied_by_others
+                # filter out the gpus to be occupied by others
             ]
 
-            # start the process on the available gpus
-            if len(available_gpus) > 0:
-                start_process_on_gpus(args.command, [gpu.id for gpu in available_gpus])
+            # start the process on the available gpus IF the process is not running
+            if len(available_gpus) > 0 and process is None:
+                start_process_on_gpus(
+                    args.command, [gpu.id for gpu in available_gpus]
+                )
                 return jsonify({
                     'status': 'success',
                     'message': 'Use currently available GPUs: {}'.format(
@@ -103,19 +131,19 @@ def set_occupied():
                     )
                 })
             else:
-                return jsonify({
-                    'status': 'success',
-                    'message': 'No available GPUs - process will not started'
-                })
-
-@app.route("/gpu", methods=["GET"])
-def get_available_gpus():
-    """Get the available GPUs.
-    """
-    return jsonify([gpu.id for gpu in available_gpus])
+                if len(available_gpus) == 0:
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'No available GPUs - process will not started'
+                    })
+                else:
+                    return jsonify({
+                        'status': 'success',
+                        'message': 'This set_occupied request does not affect existing process.'
+                    })
 
 # start the command in a subprocess
 start_process_on_gpus(args.command, [gpu.id for gpu in available_gpus])
 
 # start the flask app
-app.run(debug=True)
+app.run(debug=False, threaded=False)
