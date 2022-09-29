@@ -119,6 +119,12 @@ def set_occupied():
                 # filter out the gpus to be occupied by others
             ]
 
+            if process is not None and len(available_gpus) > len(command_occupied_gpu_ids):
+                # if there are more available gpus than the gpus occupied by the process
+                # kill the process and will start a new one
+                kill_process()
+                time.sleep(10)
+
             # start the process on the available gpus IF the process is not running
             if len(available_gpus) > 0 and process is None:
                 start_process_on_gpus(
@@ -146,4 +152,8 @@ def set_occupied():
 start_process_on_gpus(args.command, [gpu.id for gpu in available_gpus])
 
 # start the flask app
-app.run(debug=False, threaded=False)
+app.run(debug=False, threaded=False, port=args.port)
+
+# if app.run is not blocking
+print(f"* Flask App failed to start. Kill the process.")
+kill_process()
