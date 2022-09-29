@@ -83,7 +83,7 @@ def set_occupied():
                     )
                     process.kill()
                     # wait for the process to free the gpus
-                    time.sleep(1)
+                    time.sleep(10)
 
             # update gpu info and get the available gpus
             update_gpu_info()
